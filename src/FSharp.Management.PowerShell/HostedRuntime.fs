@@ -16,6 +16,10 @@ type IPSRuntime =
 
 /// PowerShell runtime built into the current process
 type PSRuntimeHosted private (runSpace: Runspace) =
+
+    do 
+        Thread.CurrentPrincipal <- GenericPrincipal(GenericIdentity("PowerShellTypeProvider"), null)
+        runSpace.Open()
     let commandInfos =
         //Get-Command -CommandType @("cmdlet","function") -ListImported
         PowerShell.Create(Runspace=runSpace)
@@ -80,11 +84,8 @@ type PSRuntimeHosted private (runSpace: Runspace) =
         | _ -> String.Empty
 
     let xmlDocs = System.Collections.Generic.Dictionary<_,_>()
-    do 
-        Thread.CurrentPrincipal <- GenericPrincipal(GenericIdentity("PowerShellTypeProvider"), null)
-        runSpace.Open()
 
-    new(snapIns:string[], modules:string[]) =
+    new(snapIns:string[], modules:string[], ?psHost) =
         let runspace = 
             let initState = InitialSessionState.CreateDefault()
             initState.AuthorizationManager <- new Microsoft.PowerShell.PSAuthorizationManager("Microsoft.PowerShell")
@@ -100,10 +101,11 @@ type PSRuntimeHosted private (runSpace: Runspace) =
             let modules = modules |> Array.filter (String.IsNullOrWhiteSpace >> not)
             if not <| Array.isEmpty modules then
                 initState.ImportPSModule(modules);
-
-            RunspaceFactory.CreateRunspace(initState)
+            match psHost with
+            | Some psHost -> RunspaceFactory.CreateRunspace(psHost, initState)
+            | None -> RunspaceFactory.CreateRunspace(initState)
         PSRuntimeHosted(runspace)
-
+        
     new(host, computerName, port, appName, shellUri, credentials) =
         let connectionInfo = WSManConnectionInfo(true, computerName, port, appName, shellUri, credentials)
         PSRuntimeHosted(RunspaceFactory.CreateRunspace(host, connectionInfo))
