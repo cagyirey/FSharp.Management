@@ -15,42 +15,20 @@ type IPSRuntime =
     abstract member Runspace   : System.Management.Automation.Runspaces.Runspace
 
 /// PowerShell runtime built into the current process
-type PSRuntimeHosted(snapIns:string[], modules:string[]) =
-    let runSpace =
-        try
-            let initState = InitialSessionState.CreateDefault()
-            initState.AuthorizationManager <- new Microsoft.PowerShell.PSAuthorizationManager("Microsoft.PowerShell")
-            
-            // Import SnapIns
-            for snapIn in snapIns do
-                if not <| String.IsNullOrEmpty(snapIn) then
-                    let _, ex = initState.ImportPSSnapIn(snapIn)
-                    if ex <> null then
-                        failwithf "ImportPSSnapInExceptions: %s" ex.Message
-
-            // Import modules
-            let modules = modules |> Array.filter (String.IsNullOrWhiteSpace >> not)
-            if not <| Array.isEmpty modules then
-                initState.ImportPSModule(modules);
-
-            let rs = RunspaceFactory.CreateRunspace(initState)
-            Thread.CurrentPrincipal <- GenericPrincipal(GenericIdentity("PowerShellTypeProvider"), null)
-            rs.Open()
-            rs
-        with
-        | e -> failwithf "Could not create PowerShell Runspace: '%s'" e.Message
+type PSRuntimeHosted private (runSpace: Runspace) =
     let commandInfos =
         //Get-Command -CommandType @("cmdlet","function") -ListImported
         PowerShell.Create(Runspace=runSpace)
-          .AddCommand("Get-Command")
-          .AddParameter("CommandType", ["cmdlet"; "function"])  // Get only cmdlets and functions (without aliases)
-          .AddParameter("ListImported")                         // Get only commands imported into current runtime
-          .Invoke()
+            .AddCommand("Get-Command")
+            .AddParameter("CommandType", ["cmdlet"; "function"])  // Get only cmdlets and functions (without aliases)
+            .AddParameter("ListImported")                         // Get only commands imported into current runtime
+            .Invoke()
         |> Seq.map (fun x ->
             match x.BaseObject with
             | :? CommandInfo as ci -> ci
             | w -> failwithf "Unsupported type of command: %A" w)
         |> Seq.toArray
+
     let commands =
         try
             commandInfos
@@ -72,6 +50,7 @@ type PSRuntimeHosted(snapIns:string[], modules:string[]) =
             |> Map.ofSeq
         with
         | e -> failwithf "Could not load command: %s\n%s" e.Message e.StackTrace
+
     let allCommands = commands |> Map.toSeq |> Seq.map snd |> Seq.toArray
 
     let getXmlDoc(cmdName:string) =
@@ -85,6 +64,7 @@ type PSRuntimeHosted(snapIns:string[], modules:string[]) =
         let (?) (this : PSObject) (prop : string) : obj =
             let prop = this.Properties |> Seq.find (fun p -> p.Name = prop)
             prop.Value
+
         match result with
         | [|help|] ->
             let lines =
@@ -98,11 +78,44 @@ type PSRuntimeHosted(snapIns:string[], modules:string[]) =
             sprintf "<summary><para>%s</para></summary>"
                 (String.Join("</para><para>", lines |> Array.map (fun s->s.Replace("<","").Replace(">",""))))
         | _ -> String.Empty
+
     let xmlDocs = System.Collections.Generic.Dictionary<_,_>()
+    do 
+        Thread.CurrentPrincipal <- GenericPrincipal(GenericIdentity("PowerShellTypeProvider"), null)
+        runSpace.Open()
+
+    new(snapIns:string[], modules:string[]) =
+        let runspace = 
+            let initState = InitialSessionState.CreateDefault()
+            initState.AuthorizationManager <- new Microsoft.PowerShell.PSAuthorizationManager("Microsoft.PowerShell")
+            
+            // Import SnapIns
+            for snapIn in snapIns do
+                if not <| String.IsNullOrEmpty(snapIn) then
+                    let _, ex = initState.ImportPSSnapIn(snapIn)
+                    if ex <> null then
+                        failwithf "ImportPSSnapInExceptions: %s" ex.Message
+
+            // Import modules
+            let modules = modules |> Array.filter (String.IsNullOrWhiteSpace >> not)
+            if not <| Array.isEmpty modules then
+                initState.ImportPSModule(modules);
+
+            RunspaceFactory.CreateRunspace(initState)
+        PSRuntimeHosted(runspace)
+
+    new(host, computerName, port, appName, shellUri, credentials) =
+        let connectionInfo = WSManConnectionInfo(true, computerName, port, appName, shellUri, credentials)
+        PSRuntimeHosted(RunspaceFactory.CreateRunspace(host, connectionInfo))
 
     interface IPSRuntime with
         member __.Runspace = runSpace
         member __.AllCommands() = allCommands
+        member __.GetXmlDoc (cmdName:string) =
+            if not <| xmlDocs.ContainsKey cmdName
+                then xmlDocs.Add(cmdName, getXmlDoc cmdName)
+            xmlDocs.[cmdName]
+
         member __.Execute(uniqueId, parameters:obj seq) =
             let cmd = commands.[uniqueId]
 
@@ -124,19 +137,18 @@ type PSRuntimeHosted(snapIns:string[], modules:string[]) =
             let result = ps.Invoke()           
 
             // Infer type of the result
-            match getTypeOfObjects cmd.ResultObjectTypes result with
+            match (getTypeOfObjects cmd.ResultObjectTypes result) with
             | None -> 
                 if ps.Streams.Error.Count > 0 then                       
                     let errors = ps.Streams.Error |> Seq.cast<ErrorRecord> |> List.ofSeq   
                     cmd.ResultType.GetMethod("NewFailure").Invoke(null, [|errors|])
                 else                    
-                    let boxedResult = if result.Count > 0 then
-                                            box (new PSObject(result))
-                                        else
-                                            box None
-
-                    cmd.ResultType.GetMethod("NewSuccess").Invoke(null, [|boxedResult|])    // Result of execution is empty object
-
+                    let boxedResult = 
+                        if result.Count > 0 then
+                            box (new PSObject(result))
+                        else
+                            box None
+                    cmd.ResultType.GetMethod("NewSuccess").Invoke(null, [|boxedResult|])
             | Some(tyOfObj) ->
                 let collectionConverter =
                     typedefof<CollectionConverter<_>>.MakeGenericType(tyOfObj)
@@ -146,19 +158,17 @@ type PSRuntimeHosted(snapIns:string[], modules:string[]) =
                 let typedCollection =
                     collectionConverter.GetMethod("Convert").Invoke(null, [|collectionObj|])
 
-                let choise =
-                    if (cmd.ResultObjectTypes.Length = 1)
-                    then typedCollection
-                    else let ind = cmd.ResultObjectTypes |> Array.findIndex (fun x-> x = tyOfObj)
-                         let funcName = sprintf "NewChoice%dOf%d" (ind+1) (cmd.ResultObjectTypes.Length)
-                         cmd.ResultType.GetGenericArguments().[0] // GenericTypeArguments in .NET 4.5
+                let choice =
+                    if (cmd.ResultObjectTypes.Length = 1) then typedCollection
+                    else 
+                        let ind = cmd.ResultObjectTypes |> Array.findIndex (fun x-> x = tyOfObj)
+                        let funcName = sprintf "NewChoice%dOf%d" (ind+1) (cmd.ResultObjectTypes.Length)
+                        cmd.ResultType.GetGenericArguments().[0] // GenericTypeArguments in .NET 4.5
                             .GetMethod(funcName).Invoke(null, [|typedCollection|])
-
-                cmd.ResultType.GetMethod("NewSuccess").Invoke(null, [|choise|])                
-        member __.GetXmlDoc (cmdName:string) =
-            if not <| xmlDocs.ContainsKey cmdName
-                then xmlDocs.Add(cmdName, getXmlDoc cmdName)
-            xmlDocs.[cmdName]
+                
+                cmd.ResultType.GetMethod("NewSuccess").Invoke(null, [|choice|])   
+                
+        
 
     interface IDisposable with
         member __.Dispose () = runSpace.Dispose()

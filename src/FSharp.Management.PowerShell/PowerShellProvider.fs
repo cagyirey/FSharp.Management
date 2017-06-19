@@ -1,9 +1,11 @@
 ﻿namespace FSharp.Management.PowerShellProvider
 
+open System
 open System.Reflection
 open ProviderImplementation.ProvidedTypes
 open Microsoft.FSharp.Core.CompilerServices
 open FSharp.Management.Helper
+open Microsoft.FSharp.Quotations
 
 [<TypeProvider>]
 type public PowerShellProvider(_cfg: TypeProviderConfig) as this =
@@ -29,6 +31,7 @@ type public PowerShellProvider(_cfg: TypeProviderConfig) as this =
             let modules   = parameterValues.[0] :?> string
             let psSnapIns = parameterValues.[1] :?> string
             let is64bitRequired = parameterValues.[2] :?> bool
+            let customRuntime = parameterValues.[3] :?> Expr<HostedRuntime.IPSRuntime>
             
             let createMembers areStatic = [
                 let runtime = Runtime.Current(psSnapIns.Split(';'), modules.Split(';'), is64bitRequired, true)
@@ -85,7 +88,8 @@ type public PowerShellProvider(_cfg: TypeProviderConfig) as this =
             pty.AddMembersDelayed(fun() -> createMembers true)
 
             let customRunspace = ProvidedTypeDefinition("CustomRunspace", Some(typeof<obj>))
-            customRunspace.AddMember <| ProvidedConstructor([], InvokeCode = fun args -> <@@ new HostedRuntime.PSRuntimeHosted(psSnapIns.Split(';'), modules.Split(';')) :> HostedRuntime.IPSRuntime @@>)
+            customRunspace.AddMember <| ProvidedConstructor([], InvokeCode = fun args -> <@@ %customRuntime @@> )
+            
             customRunspace.AddInterfaceImplementation <| typeof<System.IDisposable>
             customRunspace.AddMemberDelayed <| fun _ -> ProvidedMethod("Dispose", [], typeof<unit>, 
                                                             InvokeCode = 
